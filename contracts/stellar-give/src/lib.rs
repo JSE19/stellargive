@@ -95,6 +95,56 @@ fn write_campaign(env: &Env, campaign: &Campaign) {
         .set(&campaign_key(campaign.id), campaign);
 }
 
+fn top_donors_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("TDON"), id)
+}
+
+fn read_top_donors(env: &Env, id: u64) -> Vec<(Address, i128)> {
+    env.storage()
+        .persistent()
+        .get(&top_donors_key(id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn write_top_donors(env: &Env, id: u64, donors: &Vec<(Address, i128)>) {
+    env.storage()
+        .persistent()
+        .set(&top_donors_key(id), donors);
+}
+
+fn update_top_donors(env: &Env, campaign_id: u64, donor: &Address, amount: i128) {
+    let old = read_top_donors(env, campaign_id);
+    let mut new_donors: Vec<(Address, i128)> = Vec::new(env);
+
+    // Carry over all existing entries except the current donor; accumulate their total.
+    let mut cumulative = amount;
+    for (addr, prev) in old.iter() {
+        if addr == *donor {
+            cumulative = prev.saturating_add(amount);
+        } else {
+            new_donors.push_back((addr, prev));
+        }
+    }
+
+    // Find sorted insertion position (descending). Insertion sort is O(5) — constant cost.
+    let mut pos = new_donors.len();
+    for i in 0..new_donors.len() {
+        if new_donors.get(i).unwrap().1 < cumulative {
+            pos = i;
+            break;
+        }
+    }
+
+    // Only write when donor enters the top-5 window.
+    if pos < 5 {
+        new_donors.insert(pos, (donor.clone(), cumulative));
+        while new_donors.len() > 5 {
+            new_donors.pop_back();
+        }
+        write_top_donors(env, campaign_id, &new_donors);
+    }
+}
+
 fn enter_lock(env: &Env) -> Result<(), ContractError> {
     let key = lock_key();
     // Temporary lock prevents re-entrant state changes in the same execution context.
@@ -247,6 +297,7 @@ impl StellarGiveContract {
             };
 
             write_campaign(&env, &campaign);
+            update_top_donors(&env, campaign.id, &donor, amount);
             env.events().publish(
                 (symbol_short!("donation"), symbol_short!("received")),
                 (
@@ -333,6 +384,14 @@ impl StellarGiveContract {
         let mut campaign = read_campaign(&env, campaign_id)?;
         campaign.status = derive_status(env.ledger().timestamp(), &campaign);
         Ok(campaign)
+    }
+
+    pub fn get_top_donors(
+        env: Env,
+        campaign_id: u64,
+    ) -> Result<Vec<(Address, i128)>, ContractError> {
+        read_campaign(&env, campaign_id)?;
+        Ok(read_top_donors(&env, campaign_id))
     }
 }
 
@@ -679,6 +738,146 @@ mod tests {
             &token_client.address,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn top_donors_single_donation() {
+        let (env, client, creator, beneficiary, donor, token_client, _) = setup();
+        set_timestamp(&env, 1_000);
+
+        let mut bens = Vec::new(&env);
+        bens.push_back((beneficiary.clone(), 10_000_u32));
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Relief"),
+            &500_000,
+            &2_000,
+            &token_client.address,
+        );
+
+        client.donate(&donor, &campaign_id, &50_000);
+        let top = client.get_top_donors(&campaign_id);
+
+        assert_eq!(top.len(), 1);
+        let (addr, amt) = top.get(0).unwrap();
+        assert_eq!(addr, donor);
+        assert_eq!(amt, 50_000);
+    }
+
+    #[test]
+    fn top_donors_sorted_descending() {
+        let (env, client, creator, beneficiary, donor, token_client, token_admin_client) = setup();
+        let donor2 = Address::generate(&env);
+        let donor3 = Address::generate(&env);
+        token_admin_client.mint(&donor2, &1_000_000);
+        token_admin_client.mint(&donor3, &1_000_000);
+        set_timestamp(&env, 1_000);
+
+        let mut bens = Vec::new(&env);
+        bens.push_back((beneficiary.clone(), 10_000_u32));
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Relief"),
+            &500_000,
+            &5_000,
+            &token_client.address,
+        );
+
+        client.donate(&donor, &campaign_id, &30_000);
+        client.donate(&donor2, &campaign_id, &60_000);
+        client.donate(&donor3, &campaign_id, &10_000);
+        let top = client.get_top_donors(&campaign_id);
+
+        assert_eq!(top.len(), 3);
+        assert_eq!(top.get(0).unwrap().1, 60_000);
+        assert_eq!(top.get(0).unwrap().0, donor2);
+        assert_eq!(top.get(1).unwrap().1, 30_000);
+        assert_eq!(top.get(2).unwrap().1, 10_000);
+    }
+
+    #[test]
+    fn top_donors_accumulates_repeat_donor() {
+        let (env, client, creator, beneficiary, donor, token_client, _) = setup();
+        set_timestamp(&env, 1_000);
+
+        let mut bens = Vec::new(&env);
+        bens.push_back((beneficiary.clone(), 10_000_u32));
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Relief"),
+            &500_000,
+            &5_000,
+            &token_client.address,
+        );
+
+        client.donate(&donor, &campaign_id, &20_000);
+        client.donate(&donor, &campaign_id, &30_000);
+        let top = client.get_top_donors(&campaign_id);
+
+        assert_eq!(top.len(), 1);
+        assert_eq!(top.get(0).unwrap().0, donor);
+        assert_eq!(top.get(0).unwrap().1, 50_000);
+    }
+
+    #[test]
+    fn top_donors_trims_to_five() {
+        let (env, client, creator, beneficiary, _donor, token_client, token_admin_client) = setup();
+        set_timestamp(&env, 1_000);
+
+        let mut bens = Vec::new(&env);
+        bens.push_back((beneficiary.clone(), 10_000_u32));
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Relief"),
+            &1_000_000,
+            &5_000,
+            &token_client.address,
+        );
+
+        let amounts: [i128; 6] = [60_000, 50_000, 40_000, 30_000, 20_000, 10_000];
+        for &amt in amounts.iter() {
+            let d = Address::generate(&env);
+            token_admin_client.mint(&d, &1_000_000);
+            client.donate(&d, &campaign_id, &amt);
+        }
+        let top = client.get_top_donors(&campaign_id);
+
+        assert_eq!(top.len(), 5);
+        assert_eq!(top.get(0).unwrap().1, 60_000);
+        assert_eq!(top.get(4).unwrap().1, 20_000);
+    }
+
+    #[test]
+    fn top_donors_updates_rank_after_repeat_donation() {
+        let (env, client, creator, beneficiary, donor, token_client, token_admin_client) = setup();
+        let donor2 = Address::generate(&env);
+        token_admin_client.mint(&donor2, &1_000_000);
+        set_timestamp(&env, 1_000);
+
+        let mut bens = Vec::new(&env);
+        bens.push_back((beneficiary.clone(), 10_000_u32));
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Relief"),
+            &500_000,
+            &5_000,
+            &token_client.address,
+        );
+
+        client.donate(&donor, &campaign_id, &10_000);
+        client.donate(&donor2, &campaign_id, &50_000);
+        assert_eq!(client.get_top_donors(&campaign_id).get(0).unwrap().0, donor2);
+
+        client.donate(&donor, &campaign_id, &60_000); // donor total: 70_000 → now #1
+        let top = client.get_top_donors(&campaign_id);
+        assert_eq!(top.get(0).unwrap().0, donor);
+        assert_eq!(top.get(0).unwrap().1, 70_000);
+        assert_eq!(top.get(1).unwrap().0, donor2);
     }
 
     #[test]
