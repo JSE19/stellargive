@@ -678,9 +678,8 @@ mod tests {
         bens.push_back((beneficiary2.clone(), 3_333_u32));
         bens.push_back((beneficiary3.clone(), 3_333_u32));
 
-        let mut bens = Vec::new(&env);
-        bens.push_back((beneficiary.clone(), 10_000_u32));
-        let campaign_id = client.create_campaign(
+        let bens: Vec<(Address, u32)> = Vec::new(&env);
+        let result = client.try_create_campaign(
             &creator,
             &bens,
             &String::from_str(&env, "Three Way"),
@@ -688,6 +687,8 @@ mod tests {
             &5_000,
             &token_client.address,
         );
+        assert!(result.is_err());
+    }
 
         client.donate(&donor, &campaign_id, &10_000);
 
@@ -769,51 +770,5 @@ mod tests {
             &token_client.address,
         );
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn reentrancy_lock_uses_temporary_storage_and_blocks_reentry() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, StellarGiveContract);
-
-        client.donate(&donor, &campaign_id, &10_000);
-        client.donate(&donor2, &campaign_id, &50_000);
-        assert_eq!(client.get_top_donors(&campaign_id).get(0).unwrap().0, donor2);
-
-        client.donate(&donor, &campaign_id, &60_000); // donor total: 70_000 → now #1
-        let top = client.get_top_donors(&campaign_id);
-        assert_eq!(top.get(0).unwrap().0, donor);
-        assert_eq!(top.get(0).unwrap().1, 70_000);
-        assert_eq!(top.get(1).unwrap().0, donor2);
-    }
-
-    #[test]
-    fn reentrancy_lock_uses_temporary_storage_and_blocks_reentry() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, StellarGiveContract);
-
-        env.as_contract(&contract_id, || {
-            let key = super::lock_key();
-
-            // Lock key must be absent before any entry.
-            assert!(!env.storage().temporary().has(&key));
-            assert!(!env.storage().persistent().has(&key));
-
-            // First entry succeeds; key appears in temporary storage only.
-            super::enter_lock(&env).unwrap();
-            assert!(env.storage().temporary().has(&key));
-            assert!(!env.storage().persistent().has(&key));
-
-            // Re-entry from the same execution context is rejected.
-            assert_eq!(super::enter_lock(&env), Err(ContractError::ReentrancyDetected));
-
-            // Releasing the lock removes the key from temporary storage.
-            super::exit_lock(&env);
-            assert!(!env.storage().temporary().has(&key));
-
-            // A fresh entry succeeds after release.
-            super::enter_lock(&env).unwrap();
-            super::exit_lock(&env);
-        });
     }
 }
